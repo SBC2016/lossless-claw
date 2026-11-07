@@ -499,6 +499,10 @@ export class LcmContextEngine implements ContextEngine {
   private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private stableAssemblyBudgetByConversation = new Map<number, StableBudgetState>();
+  /** Conversations whose in-assemble forced recovery is running (no re-entry). */
+  private assembleForcedRecoveryInFlight = new Set<number>();
+  /** Host budget at the last in-assemble forced recovery attempt, per conversation. */
+  private assembleForcedRecoveryAttemptBudget = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
 
@@ -2789,6 +2793,35 @@ export class LcmContextEngine implements ContextEngine {
   // ── Image detection & externalization ──────────────────────────────────────
 
 
+  /**
+   * One in-assemble forced recovery per pressure episode. A new episode starts
+   * when the host budget grows again (new turn, or room freed by compaction).
+   * Requires a resolvable host transcript target; disable with
+   * LCM_ASSEMBLE_FORCED_RECOVERY=false.
+   */
+  private shouldAttemptAssembleForcedRecovery(
+    conversationId: number,
+    hostTokenBudget: number,
+    params: { sessionId: string; sessionKey?: string; runtimeContext?: Record<string, unknown> },
+  ): boolean {
+    if (process.env.LCM_ASSEMBLE_FORCED_RECOVERY === "false") return false;
+    if (!this.deps.readVisibleSessionTranscriptMessageEntries) return false;
+    if (this.assembleForcedRecoveryInFlight.has(conversationId)) return false;
+    if (!resolveSessionTranscriptReadTarget(params as Parameters<typeof resolveSessionTranscriptReadTarget>[0])) {
+      return false;
+    }
+    const previous = this.assembleForcedRecoveryAttemptBudget.get(conversationId);
+    if (previous !== undefined && hostTokenBudget <= previous) return false;
+    this.assembleForcedRecoveryAttemptBudget.delete(conversationId);
+    this.assembleForcedRecoveryAttemptBudget.set(conversationId, hostTokenBudget);
+    while (this.assembleForcedRecoveryAttemptBudget.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+      const oldest = this.assembleForcedRecoveryAttemptBudget.keys().next().value;
+      if (typeof oldest !== "number") break;
+      this.assembleForcedRecoveryAttemptBudget.delete(oldest);
+    }
+    return true;
+  }
+
   /** Remember the last effective assembly budget (bounded, oldest evicted first). */
   private setStableAssemblyBudget(conversationId: number, state: StableBudgetState): void {
     this.stableAssemblyBudgetByConversation.delete(conversationId);
@@ -4609,7 +4642,51 @@ export class LcmContextEngine implements ContextEngine {
       const storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
-      if (foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
+      // Routine pressure relief protects everything after the newest user, so
+      // inside one long tool-heavy turn it finds nothing to summarize and the
+      // prompt would degrade to a shrinking raw live clamp. Before degrading,
+      // run the authoritative forced-recovery path (the same one OpenClaw uses
+      // after an overflow) once per pressure episode: it reconciles the host
+      // transcript and may summarize completed tool groups of the current turn.
+      // Covers both outcomes of failed relief: the degraded live clamp (debt
+      // pending) and the bounded live fallback (coverage trails live input).
+      if (foregroundRelief && !foregroundRelief.reachedTarget && liveMessages.length > 0 &&
+        foregroundRelief.pressure > hostTokenBudget &&
+        this.shouldAttemptAssembleForcedRecovery(conversation.conversationId, hostTokenBudget, params)) {
+        this.assembleForcedRecoveryInFlight.add(conversation.conversationId);
+        try {
+          const recovery = await this.compact({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: "",
+            runtimeContext: params.runtimeContext,
+            runtimeSettings: params.runtimeSettings,
+            tokenBudget: hostTokenBudget,
+            currentTokenCount: foregroundRelief.pressure,
+            compactionTarget: "budget",
+            contextThresholdOverride: resolvedContextThreshold,
+            force: true,
+          });
+          this.deps.log.info(
+            `[lcm] assemble: in-turn forced recovery conversation=${conversation.conversationId} ${sessionLabel} ok=${recovery.ok} compacted=${recovery.compacted} reason=${recovery.reason ?? "none"} pressure=${foregroundRelief.pressure} hostTokenBudget=${hostTokenBudget}`,
+          );
+          // Like OpenClaw's overflow retry: partial progress still helps.
+          if (recovery.compacted) {
+            return await this.assemble(params);
+          }
+        } catch (error) {
+          this.deps.log.warn(
+            `[lcm] assemble: in-turn forced recovery failed conversation=${conversation.conversationId} ${sessionLabel} error=${describeLogError(error)}`,
+          );
+        } finally {
+          this.assembleForcedRecoveryInFlight.delete(conversation.conversationId);
+        }
+      }
+      // Right after an in-turn forced recovery, an assembled context that fits
+      // the host budget beats the raw degraded clamp, even with debt pending.
+      const recoveredContextFits = this.assembleForcedRecoveryInFlight.has(conversation.conversationId) &&
+        foregroundRelief !== null && foregroundRelief.pressure <= hostTokenBudget;
+      if (!recoveredContextFits && foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,

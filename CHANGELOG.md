@@ -1,5 +1,21 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1-sbc.2
+
+<!-- release-rollback-version: 1.2.0 -->
+
+Fork build (SBC2016/lossless-claw), not an upstream release.
+
+- assemble(): when foreground pressure relief cannot bring a long single turn under the host budget, run the authoritative forced-recovery path once per pressure episode before degrading, so completed tool groups of the current turn are summarized instead of the prompt degrading to a shrinking raw live clamp. Disable with LCM_ASSEMBLE_FORCED_RECOVERY=false.
+
+## 1.2.1-sbc.1
+
+<!-- release-rollback-version: 1.2.0 -->
+
+Fork build (SBC2016/lossless-claw), not an upstream release.
+
+- assemble(): keep the prompt prefix stable while the host budget shrinks inside one long turn (cache-stable assembly budget).
+
 ## 1.2.0
 
 <!-- release-rollback-version: 1.1.1 -->
