@@ -148,3 +148,70 @@ describe("assemble yields to host compaction", () => {
     expect(text(log.info.mock.calls)).not.toContain("yield to host compaction");
   });
 });
+
+describe("assemble yields to host compaction when stored coverage trails live", () => {
+  /**
+   * Live turn after an overflow recovery: only the first exchange was ever
+   * persisted, and the host has since truncated it in the live transcript, so
+   * the stored rows are no longer a matching prefix of the live messages.
+   */
+  async function seedPartial(engine: ReturnType<typeof fixture>["engine"]) {
+    const messages: AgentMessage[] = [];
+    for (let turn = 0; turn < 6; turn += 1) {
+      messages.push(
+        makeMessage({ role: "user", content: `Inspect observation ${turn}`, timestamp: turn * 2 + 1 }),
+        makeMessage({ role: "assistant", content: `Observation ${turn}: ${"synthetic observation. ".repeat(400)}`, timestamp: turn * 2 + 2 }),
+      );
+    }
+    await engine.ingest({ sessionId: SESSION, message: messages[0]! });
+    await engine.ingest({ sessionId: SESSION, message: makeMessage({
+      role: "assistant", content: `Observation 0 (before truncation): ${"full tool output. ".repeat(600)}`, timestamp: 2,
+    }) });
+    return messages;
+  }
+  const args = (messages: AgentMessage[], tokenBudget: number) => ({
+    sessionId: SESSION, messages, tokenBudget,
+    prompt: "Next observation", availableTools: new Set(["inspect"]),
+  });
+
+  it("hands the host the unwindowed live transcript instead of a degraded clamp", async () => {
+    const { engine, log } = fixture();
+    const messages = await seedPartial(engine);
+    await engine.assemble(args(messages, TURN_START_BUDGET));
+    log.info.mockClear(); log.warn.mockClear();
+    const output = await engine.assemble(args(messages, HOST_BUDGET));
+    expect(text(log.info.mock.calls)).toMatch(/yield to host compaction.*coverage=live/);
+    expect(text(log.warn.mock.calls)).not.toMatch(/degraded live fallback|bounded live fallback|serialized budget clamp/);
+    expect(userTurns(output.messages)).toHaveLength(6);
+    expect(output).toHaveProperty("promptAuthority", "preassembly_may_overflow");
+    expect(output.estimatedTokens).toBeGreaterThan(HOST_BUDGET);
+  });
+
+  it("keeps the prefix append-only as the budget steps down and the turn grows", async () => {
+    const { engine, log } = fixture();
+    const messages = await seedPartial(engine);
+    await engine.assemble(args(messages, TURN_START_BUDGET));
+    log.warn.mockClear();
+    const first = await engine.assemble(args(messages, HOST_BUDGET));
+    const grown = [...messages,
+      makeMessage({ role: "user", content: "Inspect observation 6", timestamp: 13 }),
+      makeMessage({ role: "assistant", content: "Observation 6: done.", timestamp: 14 })];
+    const second = await engine.assemble(args(grown, HOST_BUDGET - 2_500));
+    const third = await engine.assemble(args(grown, 1));
+    const prefix = JSON.stringify(first.messages).slice(0, -1);
+    expect(JSON.stringify(second.messages).startsWith(prefix)).toBe(true);
+    expect(JSON.stringify(third.messages)).toBe(JSON.stringify(second.messages));
+    expect(text(log.warn.mock.calls)).not.toContain("degraded live fallback");
+  });
+
+  it("degrades with coverage-trails-live as before when disabled", async () => {
+    process.env.LCM_ASSEMBLE_YIELD_TO_HOST = "false";
+    const { engine, log } = fixture();
+    const messages = await seedPartial(engine);
+    await engine.assemble(args(messages, TURN_START_BUDGET));
+    const output = await engine.assemble(args(messages, HOST_BUDGET));
+    expect(text(log.info.mock.calls)).not.toContain("yield to host compaction");
+    expect(text(log.warn.mock.calls)).toContain("reason=coverage-trails-live");
+    expect(userTurns(output.messages).length).toBeLessThan(6);
+  });
+});

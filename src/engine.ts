@@ -4718,9 +4718,7 @@ export class LcmContextEngine implements ContextEngine {
       const yieldToHost = hostDeliversCurrentTurnSeparately && sameTurnShrink &&
         process.env.LCM_ASSEMBLE_YIELD_TO_HOST !== "false" &&
         !recoveredContextFits && foregroundRelief !== null && !foregroundRelief.reachedTarget &&
-        // Only when stored coverage is complete; otherwise the degraded live
-        // fallback (which hands the host the unwindowed transcript) is safer.
-        !coverageTrailsLive && liveMessages.length > 0 &&
+        liveMessages.length > 0 &&
         foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO);
       if (yieldToHost) {
         const yieldBudget = this.applyAssemblyBudgetCap(
@@ -4729,7 +4727,7 @@ export class LcmContextEngine implements ContextEngine {
           )),
         );
         this.deps.log.info(
-          `[lcm] assemble: yield to host compaction conversation=${conversation.conversationId} ${sessionLabel} reason=${foregroundRelief.reason} pressure=${foregroundRelief.pressure} hostTokenBudget=${hostTokenBudget} tokenBudget=${tokenBudget} yieldBudget=${yieldBudget}`,
+          `[lcm] assemble: yield to host compaction conversation=${conversation.conversationId} ${sessionLabel} reason=${foregroundRelief.reason} pressure=${foregroundRelief.pressure} hostTokenBudget=${hostTokenBudget} tokenBudget=${tokenBudget} yieldBudget=${yieldBudget} coverage=${coverageTrailsLive ? "live" : "stored"}`,
         );
         tokenBudget = yieldBudget;
         this.assembleYieldEpisodes.add(conversation.conversationId);
@@ -4737,6 +4735,25 @@ export class LcmContextEngine implements ContextEngine {
           const oldest = this.assembleYieldEpisodes.values().next().value;
           if (typeof oldest !== "number") break;
           this.assembleYieldEpisodes.delete(oldest);
+        }
+        // Stored coverage trails the live transcript (e.g. the host recovered
+        // from an overflow by truncating tool results, so nothing of this turn
+        // was ever persisted). Assembling from storage would drop context, and
+        // clamping the live transcript to the collapsing budget rewrites the
+        // prefix on every step-down. Hand the host the unwindowed live
+        // transcript, flagged as possibly over budget, so its precheck sees the
+        // real size and compacts while the prefix stays append-only.
+        if (coverageTrailsLive) {
+          return buildDegradedLiveAssembleResult({
+            liveMessages,
+            tokenBudget: Math.max(
+              yieldBudget,
+              estimateSerializedMessagesTokens(liveMessages) + 1,
+              estimateAgentMessageTokens(liveMessages) + 1,
+            ),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+            contextProjection,
+          });
         }
       }
       if (!yieldToHost && !recoveredContextFits && foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {

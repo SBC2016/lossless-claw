@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1-sbc.3.1
+
+<!-- release-rollback-version: 1.2.0 -->
+
+Fork build (SBC2016/lossless-claw), not an upstream release.
+
+- assemble(): yield to host compaction also when stored coverage trails the live transcript. In a long single worker turn nothing is persisted until the turn ends, and after an overflow recovery that truncates tool results the stored rows no longer match the live prefix. sbc.3 then fell back to the degraded live clamp (reason=coverage-trails-live), which rewrote the prompt prefix on every budget step-down. It now returns the unwindowed live transcript marked `preassembly_may_overflow`, so the prefix stays append-only and the host's precheck compacts. The yield log line now reports `coverage=stored|live`. Disabled mode (LCM_ASSEMBLE_YIELD_TO_HOST=false) is unchanged.
+
 ## 1.2.1-sbc.3
 
 <!-- release-rollback-version: 1.2.0 -->
