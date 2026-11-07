@@ -4756,6 +4756,21 @@ export class LcmContextEngine implements ContextEngine {
           });
         }
       }
+      // Hold the full history while it still fits the host budget. Right after a
+      // host compaction the stable budget steps down (with headroom) as the turn
+      // grows, and assembling to it would evict history that fits, only for the
+      // next request to yield and restore it: two different prefixes and a
+      // full re-read. In prompt-separate mode history is never trimmed mid-turn;
+      // it is kept whole until it no longer fits, then the yield above applies.
+      if (!yieldToHost && hostDeliversCurrentTurnSeparately && sameTurnShrink &&
+        process.env.LCM_ASSEMBLE_YIELD_TO_HOST !== "false" &&
+        foregroundRelief === null && liveMessages.length > 0 && tokenBudget < hostTokenBudget) {
+        const holdBudget = this.applyAssemblyBudgetCap(hostTokenBudget);
+        this.deps.log.info(
+          `[lcm] assemble: hold history within host budget conversation=${conversation.conversationId} ${sessionLabel} hostTokenBudget=${hostTokenBudget} tokenBudget=${tokenBudget} holdBudget=${holdBudget}`,
+        );
+        tokenBudget = holdBudget;
+      }
       if (!yieldToHost && !recoveredContextFits && foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,

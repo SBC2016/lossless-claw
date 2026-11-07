@@ -215,3 +215,45 @@ describe("assemble yields to host compaction when stored coverage trails live", 
     expect(userTurns(output.messages).length).toBeLessThan(6);
   });
 });
+
+describe("assemble holds history that fits the host budget after a compaction", () => {
+  // Full history is ~14K tokens. After the turn starts at 30K the host budget
+  // drops to 17K: the stable budget steps down to 0.6 x 17K, below the history,
+  // although the history still fits the host budget. Then 15K: yield.
+  const args = (messages: AgentMessage[], tokenBudget: number) => ({
+    sessionId: SESSION, messages, tokenBudget,
+    prompt: "Next observation", availableTools: new Set(["inspect"]),
+  });
+
+  it("does not evict history that fits, so the next yield keeps the same prefix", async () => {
+    const { engine, log } = fixture();
+    const messages = await seed(engine);
+    await engine.assemble(args(messages, 30_000));
+    log.info.mockClear(); log.warn.mockClear();
+    const fits = await engine.assemble(args(messages, 17_000));
+    expect(text(log.info.mock.calls)).toContain("hold history within host budget");
+    expect(text(log.warn.mock.calls)).not.toMatch(/serialized budget clamp|degraded live fallback/);
+    expect(userTurns(fits.messages)).toHaveLength(6);
+    const yielded = await engine.assemble(args(messages, 15_000));
+    expect(text(log.info.mock.calls)).toContain("yield to host compaction");
+    expect(JSON.stringify(yielded.messages)).toBe(JSON.stringify(fits.messages));
+  });
+
+  it("steps down as before when disabled", async () => {
+    process.env.LCM_ASSEMBLE_YIELD_TO_HOST = "false";
+    const { engine, log } = fixture();
+    const messages = await seed(engine);
+    await engine.assemble(args(messages, 30_000));
+    const fits = await engine.assemble(args(messages, 17_000));
+    expect(text(log.info.mock.calls)).not.toContain("hold history within host budget");
+    expect(userTurns(fits.messages).length).toBeLessThan(6);
+  });
+
+  it("does not hold when the host delivers the whole transcript as history", async () => {
+    const { engine, log } = fixture();
+    const messages = await seed(engine);
+    await engine.assemble({ sessionId: SESSION, messages, tokenBudget: 30_000 });
+    await engine.assemble({ sessionId: SESSION, messages, tokenBudget: 17_000 });
+    expect(text(log.info.mock.calls)).not.toContain("hold history within host budget");
+  });
+});

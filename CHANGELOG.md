@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1-sbc.3.2
+
+<!-- release-rollback-version: 1.2.0 -->
+
+Fork build (SBC2016/lossless-claw), not an upstream release.
+
+- assemble(): hold the full history while it still fits the host budget when the host delivers the current turn separately. Right after a host compaction the stable assembly budget stepped down with headroom as the turn grew, so the first request evicted history that still fit (serialized budget clamp) and the next request yielded and restored it: two different prefixes and a full re-read after every compaction. History is now kept whole until it no longer fits, then the yield-to-host path applies. Logged as `hold history within host budget`. Disabled together with yield-to-host by LCM_ASSEMBLE_YIELD_TO_HOST=false.
+
 ## 1.2.1-sbc.3.1
 
 <!-- release-rollback-version: 1.2.0 -->
