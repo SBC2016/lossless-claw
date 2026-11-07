@@ -110,6 +110,7 @@ import {
 import { extractStableEventKey } from "./stable-event-key.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
+import { resolveStableAssemblyBudget, type StableBudgetState } from "./stable-assembly-budget.js";
 import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
@@ -497,6 +498,7 @@ export class LcmContextEngine implements ContextEngine {
   // never capture a foreground async scope or call-bound LLM capability here.
   private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
+  private stableAssemblyBudgetByConversation = new Map<number, StableBudgetState>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
 
@@ -2787,6 +2789,17 @@ export class LcmContextEngine implements ContextEngine {
   // ── Image detection & externalization ──────────────────────────────────────
 
 
+  /** Remember the last effective assembly budget (bounded, oldest evicted first). */
+  private setStableAssemblyBudget(conversationId: number, state: StableBudgetState): void {
+    this.stableAssemblyBudgetByConversation.delete(conversationId);
+    this.stableAssemblyBudgetByConversation.set(conversationId, state);
+    while (this.stableAssemblyBudgetByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+      const oldest = this.stableAssemblyBudgetByConversation.keys().next().value;
+      if (typeof oldest !== "number") break;
+      this.stableAssemblyBudgetByConversation.delete(oldest);
+    }
+  }
+
   /**
    * Return the most recent assembled snapshot for a conversation and refresh its
    * recency so the bounded debug cache behaves as an LRU.
@@ -4474,13 +4487,23 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
-      const tokenBudget = this.applyAssemblyBudgetCap(
+      const hostTokenBudget = this.applyAssemblyBudgetCap(
         typeof params.tokenBudget === "number" &&
         Number.isFinite(params.tokenBudget) &&
         params.tokenBudget > 0
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
+      // Inside one long turn the host budget shrinks on every request. Assemble
+      // to a held-steady effective budget so the eviction / live-clamp boundary
+      // (and with it the prompt prefix) does not move on every request.
+      // Compaction pressure below still uses the real host budget.
+      const stableBudget = resolveStableAssemblyBudget({
+        hostBudget: hostTokenBudget,
+        previous: this.stableAssemblyBudgetByConversation.get(conversation.conversationId),
+      });
+      this.setStableAssemblyBudget(conversation.conversationId, stableBudget.state);
+      const tokenBudget = stableBudget.budget;
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
         runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
@@ -4515,7 +4538,7 @@ export class LcmContextEngine implements ContextEngine {
       const foregroundRelief = await this.relieveAssemblyPressure({
         ...params,
         conversationId: conversation.conversationId,
-        tokenBudget,
+        tokenBudget: hostTokenBudget,
         contextThreshold: resolvedContextThreshold,
         measure: async () => {
           const projection = await this.assembler.assemble({
@@ -4586,7 +4609,7 @@ export class LcmContextEngine implements ContextEngine {
       const storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
-      if (foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(tokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
+      if (foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,
