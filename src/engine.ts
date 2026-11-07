@@ -110,7 +110,7 @@ import {
 import { extractStableEventKey } from "./stable-event-key.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
-import { resolveStableAssemblyBudget, type StableBudgetState } from "./stable-assembly-budget.js";
+import { resolveStableAssemblyBudget, STABLE_BUDGET_DRIFT_RATIO, type StableBudgetState } from "./stable-assembly-budget.js";
 import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
@@ -253,6 +253,10 @@ const HOST_BEFORE_RESET_REASON_RESET = "reset";
 const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
+/** Headroom over measured pressure when yielding to host compaction, on top of
+ * the serialized clamp's safety ratio, so the clamp does not trim history on
+ * estimate differences. */
+const YIELD_TO_HOST_BUDGET_MARGIN = 1.05;
 const DEFERRED_ASSEMBLY_PRESSURE_RATIO = 0.75;
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 type CompactionExecutionParams = {
@@ -501,6 +505,8 @@ export class LcmContextEngine implements ContextEngine {
   private stableAssemblyBudgetByConversation = new Map<number, StableBudgetState>();
   /** Conversations whose in-assemble forced recovery is running (no re-entry). */
   private assembleForcedRecoveryInFlight = new Set<number>();
+  /** Conversations inside a yield-to-host episode (until the host budget grows). */
+  private assembleYieldEpisodes = new Set<number>();
   /** Host budget at the last in-assemble forced recovery attempt, per conversation. */
   private assembleForcedRecoveryAttemptBudget = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
@@ -4531,12 +4537,23 @@ export class LcmContextEngine implements ContextEngine {
       // to a held-steady effective budget so the eviction / live-clamp boundary
       // (and with it the prompt prefix) does not move on every request.
       // Compaction pressure below still uses the real host budget.
+      const previousStableBudget = this.stableAssemblyBudgetByConversation.get(conversation.conversationId);
       const stableBudget = resolveStableAssemblyBudget({
         hostBudget: hostTokenBudget,
-        previous: this.stableAssemblyBudgetByConversation.get(conversation.conversationId),
+        previous: previousStableBudget,
       });
+      // Same-turn shrink: the host budget drifted down from the previous call
+      // (not a new turn, which grows it, nor a large single change of limits).
+      // A yield episode, once started, lasts until the host budget grows.
+      if (previousStableBudget && hostTokenBudget > previousStableBudget.hostBudget) {
+        this.assembleYieldEpisodes.delete(conversation.conversationId);
+      }
+      const sameTurnShrink = this.assembleYieldEpisodes.has(conversation.conversationId) || (
+        previousStableBudget !== undefined &&
+        hostTokenBudget < previousStableBudget.hostBudget &&
+        hostTokenBudget >= Math.floor(previousStableBudget.hostBudget * STABLE_BUDGET_DRIFT_RATIO));
       this.setStableAssemblyBudget(conversation.conversationId, stableBudget.state);
-      const tokenBudget = stableBudget.budget;
+      let tokenBudget = stableBudget.budget;
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
         runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
@@ -4650,7 +4667,11 @@ export class LcmContextEngine implements ContextEngine {
       // transcript and may summarize completed tool groups of the current turn.
       // Covers both outcomes of failed relief: the degraded live clamp (debt
       // pending) and the bounded live fallback (coverage trails live input).
-      if (foregroundRelief && !foregroundRelief.reachedTarget && liveMessages.length > 0 &&
+      // Not when the host delivers the current turn separately: its pending
+      // messages are appended raw after assembly, so summarizing them here
+      // cannot shrink them and could duplicate them (see yield-to-host below).
+      if (!hostDeliversCurrentTurnSeparately &&
+        foregroundRelief && !foregroundRelief.reachedTarget && liveMessages.length > 0 &&
         foregroundRelief.pressure > hostTokenBudget &&
         this.shouldAttemptAssembleForcedRecovery(conversation.conversationId, hostTokenBudget, params)) {
         this.assembleForcedRecoveryInFlight.add(conversation.conversationId);
@@ -4686,7 +4707,39 @@ export class LcmContextEngine implements ContextEngine {
       // the host budget beats the raw degraded clamp, even with debt pending.
       const recoveredContextFits = this.assembleForcedRecoveryInFlight.has(conversation.conversationId) &&
         foregroundRelief !== null && foregroundRelief.pressure <= hostTokenBudget;
-      if (!recoveredContextFits && foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
+      // Yield to host compaction. When the host delivers the current turn
+      // separately, its budget for history shrinks by every pending message of
+      // the turn, and only the host's own compaction can reduce those. Clamping
+      // history to the collapsing budget hides the pressure from the host's
+      // overflow precheck and rewrites the prompt prefix on every request (a
+      // full prefill each time). Instead keep the history assembled at a stable
+      // size so the host sees the overflow and compacts the turn itself.
+      // Disable with LCM_ASSEMBLE_YIELD_TO_HOST=false.
+      const yieldToHost = hostDeliversCurrentTurnSeparately && sameTurnShrink &&
+        process.env.LCM_ASSEMBLE_YIELD_TO_HOST !== "false" &&
+        !recoveredContextFits && foregroundRelief !== null && !foregroundRelief.reachedTarget &&
+        // Only when stored coverage is complete; otherwise the degraded live
+        // fallback (which hands the host the unwindowed transcript) is safer.
+        !coverageTrailsLive && liveMessages.length > 0 &&
+        foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO);
+      if (yieldToHost) {
+        const yieldBudget = this.applyAssemblyBudgetCap(
+          Math.max(tokenBudget, Math.ceil(
+            foregroundRelief.pressure * YIELD_TO_HOST_BUDGET_MARGIN / SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+          )),
+        );
+        this.deps.log.info(
+          `[lcm] assemble: yield to host compaction conversation=${conversation.conversationId} ${sessionLabel} reason=${foregroundRelief.reason} pressure=${foregroundRelief.pressure} hostTokenBudget=${hostTokenBudget} tokenBudget=${tokenBudget} yieldBudget=${yieldBudget}`,
+        );
+        tokenBudget = yieldBudget;
+        this.assembleYieldEpisodes.add(conversation.conversationId);
+        while (this.assembleYieldEpisodes.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+          const oldest = this.assembleYieldEpisodes.values().next().value;
+          if (typeof oldest !== "number") break;
+          this.assembleYieldEpisodes.delete(oldest);
+        }
+      }
+      if (!yieldToHost && !recoveredContextFits && foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(hostTokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,

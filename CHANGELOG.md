@@ -1,5 +1,14 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1-sbc.3
+
+<!-- release-rollback-version: 1.2.0 -->
+
+Fork build (SBC2016/lossless-claw), not an upstream release.
+
+- assemble(): yield to host compaction. When the host delivers the current turn separately and its history budget shrinks inside one turn, keep the assembled history at a stable size instead of clamping it to the collapsing budget. The prompt prefix stays unchanged between requests and the host's overflow precheck sees the real size, so it compacts the turn promptly. The yield lasts until the host budget grows again; a large single change of limits is followed as before. Only with complete stored coverage. Disable with LCM_ASSEMBLE_YIELD_TO_HOST=false.
+- The in-turn forced recovery from sbc.2 no longer runs when the host delivers the current turn separately (it could not shrink those messages and risked duplicating them).
+
 ## 1.2.1-sbc.2
 
 <!-- release-rollback-version: 1.2.0 -->
